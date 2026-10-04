@@ -1,0 +1,36 @@
+{
+  "tasks": [
+    {
+      "name": "PDC Assignment",
+      "deadline": "2026-10-06T23:59:00",
+      "estimated_hours": 4,
+      "priority": "high"
+    },
+    {
+      "name": "Agentic AI Quiz",
+      "deadline": "2026-10-08T09:00:00",
+      "estimated_hours": 3,
+      "priority": "medium"
+    }
+  ],
+  "classes": [
+    {
+      "day": "Monday",
+      "start": "08:30",
+      "end": "14:30",
+      "title": "Classes"
+    },
+    {
+      "day": "Tuesday",
+      "start": "10:00",
+      "end": "13:00",
+      "title": "Classes"
+    }
+  ],
+  "unavailable": [],
+  "preferred_hours": {
+    "start": "16:00",
+    "end": "22:00"
+  },
+  "notes": "Sample sandbox data for StudyPlan Agent. Not real student records."
+}
