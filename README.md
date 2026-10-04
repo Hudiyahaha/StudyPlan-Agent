@@ -104,10 +104,19 @@ Ambiguous, blocked, or failing inputs diverge deliberately.
 
 See `evaluation/model_comparison.md`.
 
-- Local/default: deterministic `studyplan-mock-v1` (`MODEL_PROVIDER=mock`)
-- Optional live: OpenAI or Gemini via env vars
-- Comparison table is prepared for ~10 shared inputs and **two** models/tiers
-- Token/cost cells are marked **to be measured** — do not invent numbers
+- **Required for submission:** a live LLM. Current provider: **xAI Grok**
+- Default config: `MODEL_PROVIDER=grok`, `MODEL_NAME=grok-4.3`
+- Second tier for comparison: `grok-4.6` (exposed in `/models` when `XAI_API_KEY` is set)
+- Offline fallback: `studyplan-mock-v1` only when `XAI_API_KEY` is missing (local/tests)
+- Token/cost cells must be measured — do not invent numbers
+
+### Get an xAI Grok API key
+
+1. Open [https://console.x.ai/](https://console.x.ai/)
+2. Sign in and create an API key
+3. Put it in local `.env` as `XAI_API_KEY=...` (never commit it)
+4. Also add `XAI_API_KEY` in **Render → Environment**
+5. Restart the app and check `GET /health` shows `"live_llm": true`
 
 ---
 
@@ -263,9 +272,9 @@ See `.env.example`.
 
 | Variable | Meaning |
 |---|---|
-| `MODEL_PROVIDER` | `mock` (default), `openai`, or `gemini` |
-| `MODEL_NAME` | Model id |
-| `OPENAI_API_KEY` / `GEMINI_API_KEY` | Provider secrets (never commit) |
+| `MODEL_PROVIDER` | `grok` (live) or `mock` (offline fallback) |
+| `MODEL_NAME` | e.g. `grok-4.3` or `grok-4.6` |
+| `XAI_API_KEY` | xAI secret (never commit) |
 | `MAX_STEPS` / `MAX_TOOL_RETRIES` | Loop bounds |
 | `PREFERRED_START` / `PREFERRED_END` | Default study window |
 | `STUDY_BLOCK_MINUTES` | Preferred block size (default 90) |

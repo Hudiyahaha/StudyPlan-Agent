@@ -1,4 +1,4 @@
-"""Model provider abstraction with deterministic mock + optional live providers."""
+"""Model provider abstraction: Grok (xAI) for submission, mock only as fallback."""
 from __future__ import annotations
 
 import json
@@ -15,6 +15,10 @@ from app.tools import TOOLS, extract_study_context
 
 log = logging.getLogger("studyplan.llm")
 
+# Two Grok tiers for the required model-selection experiment.
+GROK_PRIMARY = "grok-4.3"
+GROK_SECONDARY = "grok-4.6"
+
 BLOCKED_PATTERNS = [
     r"\bsubmit\b.+\b(assignment|coursework|homework|quiz|form)\b",
     r"\bsend\b.+\bemail\b",
@@ -27,34 +31,63 @@ BLOCKED_PATTERNS = [
 
 
 class ModelUsage:
-    def __init__(self, input_tokens: int | None = None, output_tokens: int | None = None, cost: float | None = None):
+    def __init__(
+        self,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        cost: float | None = None,
+    ):
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.estimated_cost_usd = cost
 
 
+def live_credentials_available(provider: str | None = None) -> bool:
+    provider = (provider or settings.model_provider or "").lower()
+    if provider in {"grok", "xai"}:
+        return bool(settings.xai_api_key.strip())
+    return False
+
+
 def configured_models() -> list[str]:
+    """Models shown in the UI / accepted by /chat. Never includes secrets."""
     provider = (settings.model_provider or "mock").lower()
-    name = settings.model_name or "studyplan-mock-v1"
-    models = ["studyplan-mock-v1"]
-    if provider == "mock":
-        return ["studyplan-mock-v1"]
-    if provider in {"openai", "gemini", "anthropic"} and name:
-        if name not in models:
-            models.append(name)
+    name = (settings.model_name or "").strip()
+
+    if provider in {"grok", "xai"} and live_credentials_available("grok"):
+        models = [name or GROK_PRIMARY]
+        for extra in (GROK_PRIMARY, GROK_SECONDARY):
+            if extra not in models:
+                models.append(extra)
+        models.append("studyplan-mock-v1")
         return models
-    if provider == "unconfigured":
-        return ["studyplan-mock-v1"]
-    return models
+
+    return ["studyplan-mock-v1"]
 
 
 def resolve_provider(model_name: str) -> str:
     if model_name in {"studyplan-mock-v1", "mock", "unconfigured", ""}:
         return "mock"
+    if model_name.startswith("grok"):
+        return "grok" if live_credentials_available("grok") else "mock"
     provider = (settings.model_provider or "mock").lower()
-    if provider in {"openai", "gemini", "anthropic"}:
-        return provider
+    if provider in {"grok", "xai"} and live_credentials_available("grok"):
+        return "grok"
     return "mock"
+
+
+def default_run_model() -> str:
+    """Model used by POST /arena/run."""
+    provider = (settings.model_provider or "mock").lower()
+    if provider in {"grok", "xai"} and live_credentials_available("grok"):
+        return settings.model_name.strip() or GROK_PRIMARY
+    if provider == "mock":
+        return "studyplan-mock-v1"
+    log.warning(
+        "MODEL_PROVIDER=%s but XAI_API_KEY is missing; using studyplan-mock-v1.",
+        provider,
+    )
+    return "studyplan-mock-v1"
 
 
 async def decide(
@@ -70,23 +103,22 @@ async def decide(
     provider = resolve_provider(model_name)
     if provider == "mock":
         decision = mock_decide(state, messages)
-        return decision.model_dump(), ModelUsage(input_tokens=None, output_tokens=None, cost=None)
+        return decision.model_dump(), ModelUsage()
+
     try:
-        if provider == "openai":
-            return await _openai_decide(messages, model_name)
-        if provider == "gemini":
-            return await _gemini_decide(messages, model_name)
+        if provider == "grok":
+            return await _grok_decide(messages, model_name)
     except Exception as exc:  # noqa: BLE001
-        log.warning("Live provider failed (%s); falling back to mock: %s", provider, exc)
+        log.warning("Grok call failed; falling back to mock: %s", exc)
         decision = mock_decide(state, messages)
         return decision.model_dump(), ModelUsage()
-    log.warning("Unknown provider %s; using mock", provider)
+
     decision = mock_decide(state, messages)
     return decision.model_dump(), ModelUsage()
 
 
 def mock_decide(state: AgentState, messages: list[BaseMessage]) -> AgentDecision:
-    """Deterministic policy used for local/tests and as fallback."""
+    """Deterministic offline policy used when no live key is available."""
     history_text = _history_text(messages)
     combined_goal = state.goal
     text_blob = f"{history_text}\n{combined_goal}"
@@ -103,26 +135,20 @@ def mock_decide(state: AgentState, messages: list[BaseMessage]) -> AgentDecision
             reasoning_summary="Autonomy boundary triggered.",
         )
 
-    # Seed extracted context once if empty.
     if not state.tasks and not state.validated:
         extracted = extract_study_context(combined_goal, history_text)
-        # Keep extracted values in arguments for validate tool.
-        if not state.last_observation:
-            state.tasks = []  # ensure clean
-            # Store temporary extraction on state via preferred_hours bag is messy;
-            # instead drive the first tool call with arguments.
-            return AgentDecision(
-                status="continue",
-                action="validate_study_input",
-                arguments={
-                    "tasks": extracted["tasks"],
-                    "classes": extracted["classes"],
-                    "unavailable": extracted["unavailable"],
-                    "preferred_hours": extracted["preferred_hours"],
-                },
-                user_message="Checking whether your study details are complete enough to schedule.",
-                reasoning_summary="Initial validation of extracted study context.",
-            )
+        return AgentDecision(
+            status="continue",
+            action="validate_study_input",
+            arguments={
+                "tasks": extracted["tasks"],
+                "classes": extracted["classes"],
+                "unavailable": extracted["unavailable"],
+                "preferred_hours": extracted["preferred_hours"],
+            },
+            user_message="Checking whether your study details are complete enough to schedule.",
+            reasoning_summary="Initial validation of extracted study context.",
+        )
 
     if not state.validated:
         extracted = extract_study_context(combined_goal, history_text)
@@ -175,7 +201,6 @@ def mock_decide(state: AgentState, messages: list[BaseMessage]) -> AgentDecision
             reasoning_summary="Conflict check before finalizing.",
         )
 
-    # If conflicts exist after check, still summarize with warnings rather than looping forever.
     if not state.summary:
         return AgentDecision(
             status="continue",
@@ -217,7 +242,6 @@ def _history_text(messages: list[BaseMessage]) -> str:
     parts: list[str] = []
     for message in messages:
         if isinstance(message, HumanMessage):
-            # Skip the dynamically assembled giant user block used for live models.
             content = str(message.content)
             if content.startswith("USER GOAL / CURRENT REQUEST:"):
                 continue
@@ -241,72 +265,6 @@ def _extract_json(text: str) -> dict[str, Any]:
         return json.loads(match.group(0))
 
 
-async def _openai_decide(messages: list[BaseMessage], model_name: str) -> tuple[dict[str, Any], ModelUsage]:
-    if not settings.openai_api_key:
-        log.warning("OPENAI_API_KEY missing; falling back to mock")
-        raise RuntimeError("OPENAI_API_KEY is not configured")
-    payload = {
-        "model": model_name,
-        "temperature": 0,
-        "max_tokens": settings.max_output_tokens,
-        "response_format": {"type": "json_object"},
-        "messages": [{"role": _role_for(m), "content": str(m.content)} for m in messages],
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {settings.openai_api_key}"},
-            json=payload,
-        )
-        response.raise_for_status()
-        data = response.json()
-    content = data["choices"][0]["message"]["content"]
-    usage = data.get("usage") or {}
-    return _extract_json(content), ModelUsage(
-        input_tokens=usage.get("prompt_tokens"),
-        output_tokens=usage.get("completion_tokens"),
-        cost=None,
-    )
-
-
-async def _gemini_decide(messages: list[BaseMessage], model_name: str) -> tuple[dict[str, Any], ModelUsage]:
-    if not settings.gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured")
-    # Convert messages to Gemini contents; system becomes a leading user preamble.
-    system_bits = [str(m.content) for m in messages if m.type == "system"]
-    contents = []
-    if system_bits:
-        contents.append({"role": "user", "parts": [{"text": "SYSTEM:\n" + "\n".join(system_bits)}]})
-    for message in messages:
-        if message.type == "system":
-            continue
-        role = "user" if message.type == "human" else "model"
-        contents.append({"role": role, "parts": [{"text": str(message.content)}]})
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-        f"?key={settings.gemini_api_key}"
-    )
-    payload = {
-        "contents": contents,
-        "generationConfig": {
-            "temperature": 0,
-            "maxOutputTokens": settings.max_output_tokens,
-            "responseMimeType": "application/json",
-        },
-    }
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
-    text = data["candidates"][0]["content"]["parts"][0]["text"]
-    usage_meta = data.get("usageMetadata") or {}
-    return _extract_json(text), ModelUsage(
-        input_tokens=usage_meta.get("promptTokenCount"),
-        output_tokens=usage_meta.get("candidatesTokenCount"),
-        cost=None,
-    )
-
-
 def _role_for(message: BaseMessage) -> str:
     if message.type == "system":
         return "system"
@@ -315,5 +273,52 @@ def _role_for(message: BaseMessage) -> str:
     return "user"
 
 
-# Silence unused import warning in type checkers for TOOLS documentation linkage
+async def _grok_decide(messages: list[BaseMessage], model_name: str) -> tuple[dict[str, Any], ModelUsage]:
+    if not settings.xai_api_key:
+        raise RuntimeError("XAI_API_KEY is not configured")
+
+    payload: dict[str, Any] = {
+        "model": model_name,
+        "temperature": 0,
+        "max_tokens": settings.max_output_tokens,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": _role_for(m), "content": str(m.content)} for m in messages],
+    }
+    async with httpx.AsyncClient(timeout=40) as client:
+        response = await client.post(
+            "https://api.x.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {settings.xai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        # Some Grok models may reject response_format; retry once without it.
+        if response.status_code >= 400 and "response_format" in response.text.lower():
+            payload.pop("response_format", None)
+            response = await client.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.xai_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Grok HTTP {response.status_code}: {response.text[:500]}")
+        data = response.json()
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"Unexpected Grok response shape: {data}") from exc
+
+    usage = data.get("usage") or {}
+    return _extract_json(content), ModelUsage(
+        input_tokens=usage.get("prompt_tokens"),
+        output_tokens=usage.get("completion_tokens"),
+        cost=None,
+    )
+
+
 _ = TOOLS

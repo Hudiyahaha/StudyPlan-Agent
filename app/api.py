@@ -6,7 +6,7 @@ from fastapi.responses import FileResponse
 
 from app.arena import execute
 from app.config import ROOT, settings
-from app.llm import configured_models
+from app.llm import configured_models, default_run_model, live_credentials_available
 from app.models import ArenaRequest, ArenaResponse, ChatRequest
 
 log = logging.getLogger("studyplan.api")
@@ -20,12 +20,16 @@ def index():
 
 @router.get("/health")
 def health():
+    provider = settings.model_provider
+    live = live_credentials_available(provider)
     return {
         "status": "ok",
         "implementation": "studyplan",
         "agent_name": "StudyPlan Agent",
         "domain": "Study-Plan Builder",
-        "model_provider": settings.model_provider,
+        "model_provider": provider,
+        "live_llm": live,
+        "active_model": default_run_model(),
     }
 
 
@@ -42,12 +46,7 @@ def models():
 
 @router.post("/arena/run", response_model=ArenaResponse)
 async def arena_run(payload: ArenaRequest):
-    model = settings.model_name or configured_models()[0]
-    if settings.model_provider.lower() in {"", "unconfigured"}:
-        model = "studyplan-mock-v1"
-    elif settings.model_provider.lower() == "mock":
-        model = "studyplan-mock-v1"
-    return await execute(payload, model=model)
+    return await execute(payload, model=default_run_model())
 
 
 @router.post("/chat", response_model=ArenaResponse)

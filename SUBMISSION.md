@@ -16,8 +16,8 @@ Copy these details into `i230761_submission.pdf` as well.
 - GET /arena/manifest URL: [[https://YOUR-APP.onrender.com/arena/manifest]](https://YOUR-APP.onrender.com/arena/manifest])
 - API documentation URL: [[https://YOUR-APP.onrender.com/docs]](https://YOUR-APP.onrender.com/docs])
 - Hosting provider: Render
-- Default model and provider: studyplan-mock-v1 / mock
-- Other available models: configure OpenAI or Gemini via environment variables
+- Default model and provider: grok-4.3 / xAI (Grok)
+- Other available models: grok-4.6 (second tier for comparison); mock only if no API key
 - Example input and expected behavior: "I have PDC assignment due Tuesday needing 4 hours and AI quiz Wednesday needing 3 hours. Classes Monday 8:30-14:30 and Tuesday 10:00-13:00. Make a study plan." → completed conflict-aware plan
 - Cold-start / restart limitations: Free Render instances may sleep; in-memory chat history is lost after restart; deployment uses one worker
 - Instructor repository invitation status: [pending / accepted]

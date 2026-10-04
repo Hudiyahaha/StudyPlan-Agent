@@ -10,9 +10,11 @@ services:
       - key: PYTHON_VERSION
         value: 3.12.10
       - key: MODEL_PROVIDER
-        value: mock
+        value: grok
       - key: MODEL_NAME
-        value: studyplan-mock-v1
+        value: grok-4.3
+      - key: XAI_API_KEY
+        sync: false
       - key: MAX_STEPS
         value: "6"
       - key: MAX_TOOL_RETRIES

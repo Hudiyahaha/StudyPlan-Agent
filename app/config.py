@@ -11,11 +11,9 @@ class Settings(BaseSettings):
 
     host: str = "127.0.0.1"
     port: int = 8000
-    model_provider: str = "mock"
-    model_name: str = "studyplan-mock-v1"
-    openai_api_key: str = ""
-    gemini_api_key: str = ""
-    anthropic_api_key: str = ""
+    model_provider: str = "grok"
+    model_name: str = "grok-4.3"
+    xai_api_key: str = ""
     max_steps: int = Field(default=6, ge=1, le=6)
     max_tool_retries: int = Field(default=2, ge=0, le=2)
     max_output_tokens: int = Field(default=512, ge=1)
