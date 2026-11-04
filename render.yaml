@@ -12,9 +12,9 @@ services:
       - key: MODEL_PROVIDER
         value: groq
       - key: MODEL_NAME
-        value: openai/gpt-oss-20b
+        value: qwen/qwen3.8-27b
       - key: FALLBACK_MODELS
-        value: openai/gpt-oss-120b,qwen/qwen3.8-27b
+        value: openai/gpt-oss-120b,openai/gpt-oss-20b
       - key: GROQ_API_KEY
         sync: false
       - key: MAX_STEPS

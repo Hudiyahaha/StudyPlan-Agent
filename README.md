@@ -91,7 +91,30 @@ The model's meaningful decisions are:
 ## Model selection experiment
 
 <!-- MODEL_RESULTS_START -->
-*Pending: results are recorded here after the live run. See `evaluation/model_comparison.md`.*
+Three free Groq models ran the same ten cases against live responses, with failover off and the clock pinned. Runs without provider-reported tokens would not count as live. Per-case results: `evaluation/model_comparison.md`.
+
+| Metric | `openai/gpt-oss-20b` | `openai/gpt-oss-120b` | `qwen/qwen3.8-27b` |
+|---|---|---|---|
+| Task success | 9/10 | 10/10 | 10/10 |
+| Structured-output validity | 28/29 decisions | 28/29 decisions | 28/28 decisions |
+| Correct action selection | 10/10 | 10/10 | 10/10 |
+| Provider failures (timeouts, rate limits) | 1 | 0 | 0 |
+| Average latency per run | 3037 ms | 3518 ms | 3765 ms |
+| Average input tokens per run | 2876 | 2959 | 2802 |
+| Average output tokens per run | 278 | 336 | 232 |
+| Paid-equivalent cost per run | $0.000299 | $0.000645 | not published |
+| Actual cost on the free tier | $0 | $0 | $0 |
+
+### Selection rationale
+
+**Selected: `qwen/qwen3.8-27b` as the default, with `openai/gpt-oss-120b` and `openai/gpt-oss-20b` as failover.**
+
+- **Reliability:** it completed 10/10 tasks with every decision valid and no repair needed. `gpt-oss-120b` also completed 10/10 but needed one repair. `gpt-oss-20b` completed 9/10 by this measure: on the multi-turn case the provider returned an HTTP 400 ("Tool choice is none, but model called a tool"). The agent still finished that run through its fallback, but it counts as a failure here because the model did not complete it.
+- **Cost:** it used the fewest tokens per run (2802 in, 232 out), which matters most because the free tier limits tokens per minute. All three cost $0 on the free tier. Groq publishes no price for this model, so its paid-equivalent cost is unknown; the other two cost about $0.0003 and $0.0006 per run.
+- **Latency:** its 3765 ms average includes rate-limit waits on cases 9 and 10, when its per-minute limit was reached. Its other eight runs averaged about 1840 ms. Latency across the models is not a clear differentiator in this data.
+- **Context window:** runs use about 1000 input tokens per decision, well within the 131,072-token windows Groq lists for the GPT-OSS models. Groq's models page did not list a window for this model when checked, but no run came near a limit.
+
+**Limits of this evidence:** each model ran each of the ten cases once, so small differences could be chance. The clear result is that all three handle the contract well and tokens per run are similar. `llama-3.3-70b-versatile` was the original candidate, but this API key could not access it.
 <!-- MODEL_RESULTS_END -->
 
 **Limits that keep each run affordable:** `MAX_STEPS=6`, `MAX_TOOL_RETRIES=2`, `MAX_OUTPUT_TOKENS=900` per decision, `MAX_HISTORY_MESSAGES=12` and `MAX_HISTORY_CHARS=24000`, `MAX_EXTERNAL_CHARS=6000`, `RUN_TIMEOUT_SECONDS=40`.
@@ -99,7 +122,7 @@ The model's meaningful decisions are:
 Re-run with:
 
 ```powershell
-.\.venv\Scripts\python.exe -m evaluation.run_model_comparison --models llama-3.3-70b-versatile,openai/gpt-oss-20b
+.\.venv\Scripts\python.exe -m evaluation.run_model_comparison --models openai/gpt-oss-20b,openai/gpt-oss-120b,qwen/qwen3.8-27b
 ```
 
 ### Getting a free Groq API key
@@ -229,8 +252,8 @@ Then open the interface at http://127.0.0.1:8000/ or the API docs at http://127.
 |---|---|---|
 | `GROQ_API_KEY` | Groq secret; never commit it | none |
 | `MODEL_PROVIDER` | `groq`, or `mock` for offline tests | `groq` |
-| `MODEL_NAME` | Default model | `llama-3.3-70b-versatile` |
-| `FALLBACK_MODELS` | Comma-separated failover models | `openai/gpt-oss-20b` |
+| `MODEL_NAME` | Default model | `qwen/qwen3.8-27b` |
+| `FALLBACK_MODELS` | Comma-separated failover models | `openai/gpt-oss-120b,openai/gpt-oss-20b` |
 | `LLM_TIMEOUT_SECONDS` | Limit per model call | `15` |
 | `MAX_RATE_LIMIT_WAIT_SECONDS` | Longest wait for a rate-limit window | `8` |
 | `MAX_STEPS` / `MAX_TOOL_RETRIES` | Loop bounds | `6` / `2` |

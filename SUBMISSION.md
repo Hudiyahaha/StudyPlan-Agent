@@ -17,8 +17,8 @@ Manifest endpoint (GET): PENDING (Render URL)/arena/manifest
 API documentation: PENDING (Render URL)/docs
 
 Hosting provider: Render (free plan)
-Default model / provider: PENDING (chosen from the live experiment) / Groq
-Other available models: PENDING (failover models from the live experiment)
+Default model / provider: qwen/qwen3.8-27b / Groq
+Other available models: openai/gpt-oss-120b, openai/gpt-oss-20b (also used as automatic failover)
 Example input: I have PDC assignment due Tuesday needing 4 hours and AI quiz Wednesday needing 3 hours. Classes Monday 8:30-14:30 and Tuesday 10:00-13:00. Make a study plan.
 Expected result: A completed, conflict-free plan that places all 7 hours outside class times and before each deadline.
 Cold-start / restart limitations: The free Render service sleeps when idle, so the first request can take about a minute. Chat history is held in memory and is lost on restart or sleep. The deployment uses one worker.

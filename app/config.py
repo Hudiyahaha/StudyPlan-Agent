@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8000
     model_provider: str = "groq"
-    model_name: str = "openai/gpt-oss-20b"
-    fallback_models: str = "openai/gpt-oss-120b,qwen/qwen3.8-27b"
+    model_name: str = "qwen/qwen3.8-27b"
+    fallback_models: str = "openai/gpt-oss-120b,openai/gpt-oss-20b"
     groq_api_key: str = ""
     llm_base_url: str = "https://api.groq.com/openai/v1"
     llm_timeout_seconds: float = Field(default=15, gt=0, le=40)
