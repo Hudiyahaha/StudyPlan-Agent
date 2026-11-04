@@ -1,35 +1,23 @@
 """Study-plan tools and lightweight natural-language extraction helpers."""
 from __future__ import annotations
 
-import json
+import math
 import re
-from copy import deepcopy
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import date, datetime, timedelta
 from typing import Any
 
-from app.config import ROOT, settings
-from app.models import ClassSlot, StudySession, StudyTask, UnavailableSlot
+from pydantic import ValidationError
 
-DAY_ALIASES = {
-    "mon": "Monday",
-    "monday": "Monday",
-    "tue": "Tuesday",
-    "tues": "Tuesday",
-    "tuesday": "Tuesday",
-    "wed": "Wednesday",
-    "wednesday": "Wednesday",
-    "thu": "Thursday",
-    "thur": "Thursday",
-    "thurs": "Thursday",
-    "thursday": "Thursday",
-    "fri": "Friday",
-    "friday": "Friday",
-    "sat": "Saturday",
-    "saturday": "Saturday",
-    "sun": "Sunday",
-    "sunday": "Sunday",
-}
+from app.config import current_time, settings
+from app.models import (
+    DAY_ALIASES,
+    WEEKDAYS,
+    ClassSlot,
+    StudySession,
+    StudyTask,
+    UnavailableSlot,
+    normalize_time,
+)
 
 PRIORITY_WORDS = {
     "urgent": "high",
@@ -39,6 +27,9 @@ PRIORITY_WORDS = {
     "normal": "medium",
     "low": "low",
 }
+
+SLOT_MINUTES = 30
+BREAK_MINUTES = 15
 
 
 def _normalize_day(text: str) -> str | None:
@@ -59,16 +50,9 @@ def _ranges_overlap(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
     return _to_minutes(a_start) < _to_minutes(b_end) and _to_minutes(b_start) < _to_minutes(a_end)
 
 
-def load_sample_data() -> dict[str, Any]:
-    path = ROOT / "data" / "sample_data.json"
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
 def extract_study_context(text: str, history_text: str = "") -> dict[str, Any]:
-    """Best-effort extraction from free text. Incomplete fields stay missing."""
+    """Offline-only extraction for MODEL_PROVIDER=mock. Incomplete fields stay missing."""
     blob = f"{history_text}\n{text}".strip()
-    lower = blob.lower()
-    sample = load_sample_data()
     day_alt = (
         r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
         r"mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun"
@@ -220,17 +204,7 @@ def extract_study_context(text: str, history_text: str = "") -> dict[str, Any]:
             if end > start:
                 classes.append({"day": day, "start": start, "end": end, "title": "Class"})
 
-    # If the user mentions classes but extraction failed, fall back to sample classes
-    # only when the text clearly references the sample scenario.
-    if not classes and ("class" in lower or "classes" in lower):
-        if "8:30" in lower or "8.30" in lower or "monday" in lower:
-            classes = deepcopy(sample["classes"])
-
     unavailable: list[dict[str, Any]] = []
-    if "unavailable" in lower or "busy" in lower:
-        for match in class_pattern.finditer(blob):
-            # Already captured as classes; skip unless labeled unavailable.
-            pass
 
     preferred = {
         "start": settings.preferred_start,
@@ -299,24 +273,26 @@ def _normalize_clock(token: str, context: str) -> str | None:
             token = f"{hour:02d}:{minute:02d}"
     return token
 
-
 def _deadline_for_day(day: str | None, hour: int = 23, minute: int = 59) -> str | None:
+    """Resolve a weekday name to its next occurrence, today included."""
     if not day:
         return None
-    # Anchor relative deadlines to the upcoming weekday from a fixed reference for determinism in tests.
-    # Using sample reference Monday 2026-10-05 keeps demo dates stable.
-    reference = datetime(2026, 10, 5)  # Monday
-    target = {
-        "Monday": 0,
-        "Tuesday": 1,
-        "Wednesday": 2,
-        "Thursday": 3,
-        "Friday": 4,
-        "Saturday": 5,
-        "Sunday": 6,
-    }[day]
-    date = reference + timedelta(days=target)
-    return datetime(date.year, date.month, date.day, hour, minute).isoformat()
+    today = current_time().date()
+    target = today + timedelta(days=(WEEKDAYS.index(day) - today.weekday()) % 7)
+    return datetime(target.year, target.month, target.day, hour, minute).isoformat()
+
+
+def _first_error(exc: ValidationError) -> str:
+    return exc.errors()[0]["msg"]
+
+
+def _preferred_window(raw: Any) -> dict[str, str]:
+    """Return a valid {start, end} study window, or raise ValueError."""
+    raw = raw or {"start": settings.preferred_start, "end": settings.preferred_end}
+    window = {"start": normalize_time(raw.get("start")), "end": normalize_time(raw.get("end"))}
+    if window["end"] <= window["start"]:
+        raise ValueError("Preferred study hours must end after they start.")
+    return window
 
 
 def validate_study_input(payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -329,35 +305,44 @@ def validate_study_input(payload: dict[str, Any] | None = None) -> dict[str, Any
     parsed_tasks: list[StudyTask] = []
     parsed_classes: list[ClassSlot] = []
     parsed_unavailable: list[UnavailableSlot] = []
+    now = current_time()
 
     if not tasks_raw:
-        issues.append("No study tasks were provided.")
+        issues.append("Which tasks do you need to study for?")
 
     for idx, item in enumerate(tasks_raw):
         try:
             task = StudyTask.model_validate(item)
-        except Exception as exc:  # noqa: BLE001
-            issues.append(f"Task {idx + 1} is invalid: {exc}")
+        except ValidationError as exc:
+            issues.append(f"Task {idx + 1} is invalid: {_first_error(exc)}.")
             continue
         if not task.deadline:
-            issues.append(f"Task '{task.name}' is missing a deadline.")
+            issues.append(f"Task '{task.name}' is missing a specific deadline.")
+        elif datetime.fromisoformat(task.deadline) < now:
+            issues.append(f"Task '{task.name}' has a deadline in the past ({task.deadline}).")
         if task.estimated_hours is None:
-            issues.append(f"Task '{task.name}' is missing estimated_hours.")
+            issues.append(f"Task '{task.name}' is missing estimated hours.")
         elif task.estimated_hours <= 0:
-            issues.append(f"Task '{task.name}' has a non-positive duration.")
+            issues.append(f"Task '{task.name}' needs a positive number of hours.")
         parsed_tasks.append(task)
 
     for idx, item in enumerate(classes_raw):
         try:
             parsed_classes.append(ClassSlot.model_validate(item))
-        except Exception as exc:  # noqa: BLE001
-            issues.append(f"Class slot {idx + 1} is invalid: {exc}")
+        except ValidationError as exc:
+            issues.append(f"Class slot {idx + 1} is invalid: {_first_error(exc)}.")
 
     for idx, item in enumerate(unavailable_raw):
         try:
             parsed_unavailable.append(UnavailableSlot.model_validate(item))
-        except Exception as exc:  # noqa: BLE001
-            issues.append(f"Unavailable slot {idx + 1} is invalid: {exc}")
+        except ValidationError as exc:
+            issues.append(f"Unavailable slot {idx + 1} is invalid: {_first_error(exc)}.")
+
+    preferred = {"start": settings.preferred_start, "end": settings.preferred_end}
+    try:
+        preferred = _preferred_window(payload.get("preferred_hours"))
+    except (ValueError, AttributeError) as exc:
+        issues.append(f"Preferred study hours are invalid: {exc}")
 
     complete = len(issues) == 0 and len(parsed_tasks) > 0
     return {
@@ -367,12 +352,15 @@ def validate_study_input(payload: dict[str, Any] | None = None) -> dict[str, Any
         "tasks": [t.model_dump() for t in parsed_tasks],
         "classes": [c.model_dump() for c in parsed_classes],
         "unavailable": [u.model_dump() for u in parsed_unavailable],
-        "preferred_hours": payload.get("preferred_hours") or {
-            "start": settings.preferred_start,
-            "end": settings.preferred_end,
-        },
+        "preferred_hours": preferred,
         "message": "Input is ready for scheduling." if complete else "Clarification required before scheduling.",
     }
+
+
+def _same_day(left: StudySession, right: StudySession) -> bool:
+    if left.date and right.date:
+        return left.date == right.date
+    return left.day == right.day
 
 
 def check_conflicts(payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -407,7 +395,7 @@ def check_conflicts(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     # Session vs session
     for i, left in enumerate(sessions):
         for right in sessions[i + 1 :]:
-            if left.day == right.day and _ranges_overlap(left.start, left.end, right.start, right.end):
+            if _same_day(left, right) and _ranges_overlap(left.start, left.end, right.start, right.end):
                 conflicts.append(
                     {
                         "type": "session_overlap",
@@ -425,16 +413,12 @@ def check_conflicts(payload: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def generate_study_schedule(payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Generate a conflict-aware study schedule using simple deadline/priority heuristics."""
+    """Earliest-deadline-first placement into free time between now and each deadline."""
     payload = payload or {}
     tasks = [StudyTask.model_validate(t) for t in payload.get("tasks") or []]
     classes = [ClassSlot.model_validate(c) for c in payload.get("classes") or []]
     unavailable = [UnavailableSlot.model_validate(u) for u in payload.get("unavailable") or []]
-    preferred = payload.get("preferred_hours") or {
-        "start": settings.preferred_start,
-        "end": settings.preferred_end,
-    }
-    block_hours = settings.study_block_minutes / 60.0
+    window = _preferred_window(payload.get("preferred_hours"))
 
     if not tasks:
         return {
@@ -455,63 +439,61 @@ def generate_study_schedule(payload: dict[str, Any] | None = None) -> dict[str, 
         ),
     )
 
-    # Build day list from reference week Monday..Sunday
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    occupied: dict[str, list[tuple[str, str]]] = {d: [] for d in days}
-    for item in classes + unavailable:
-        occupied[item.day].append((item.start, item.end))
+    now = current_time()
+    horizon = now + timedelta(days=settings.planning_horizon_days)
+    window_start, window_end = _to_minutes(window["start"]), _to_minutes(window["end"])
+    recurring: dict[str, list[tuple[str, str]]] = {}
+    for item in [*classes, *unavailable]:
+        recurring.setdefault(item.day, []).append((item.start, item.end))
+    booked: dict[date, list[tuple[str, str]]] = {}
 
     schedule: list[StudySession] = []
     warnings: list[str] = []
     unscheduled: dict[str, float] = {}
 
     for task in ordered:
-        remaining = float(task.estimated_hours or 0)
-        deadline_day = _day_from_deadline(task.deadline)
-        candidate_days = days[:]
-        if deadline_day:
-            # Prefer days up to and including deadline day in the demo week
-            idx = days.index(deadline_day)
-            candidate_days = days[: idx + 1]
+        needed = round(float(task.estimated_hours or 0) * 60)
+        remaining = needed
+        deadline = datetime.fromisoformat(task.deadline) if task.deadline else horizon
+        last_day = min(deadline, horizon).date()
+        day = now.date()
 
-        for day in candidate_days:
-            if remaining <= 0:
-                break
-            free_slots = _free_slots(day, occupied[day], preferred["start"], preferred["end"])
-            for start, end in free_slots:
-                if remaining <= 0:
-                    break
-                available = (_to_minutes(end) - _to_minutes(start)) / 60.0
-                if available <= 0:
-                    continue
-                take = min(remaining, block_hours, available)
-                # Round to 30-minute increments for readability
-                take = max(0.5, round(take * 2) / 2)
-                if take > available:
-                    take = available
-                if take <= 0:
-                    continue
-                session_end = _from_minutes(_to_minutes(start) + int(take * 60))
-                session = StudySession(
-                    task_name=task.name,
-                    day=day,
-                    start=start,
-                    end=session_end,
-                    duration_hours=take,
-                    date=_date_for_day(day),
-                )
-                schedule.append(session)
-                occupied[day].append((session.start, session.end))
-                occupied[day].sort(key=lambda pair: pair[0])
-                remaining -= take
+        while remaining > 0 and day <= last_day:
+            opens, closes = window_start, window_end
+            if day == now.date():
+                # Today's elapsed time is gone; start at the next half hour.
+                opens = max(opens, math.ceil((now.hour * 60 + now.minute) / SLOT_MINUTES) * SLOT_MINUTES)
+            if day == deadline.date():
+                closes = min(closes, deadline.hour * 60 + deadline.minute)
+            occupied = recurring.get(day.strftime("%A"), []) + booked.get(day, [])
+            for slot_start, slot_end in _free_slots(occupied, opens, closes):
+                cursor = slot_start
+                while remaining > 0 and slot_end - cursor >= SLOT_MINUTES:
+                    available = slot_end - cursor
+                    take = min(remaining, settings.study_block_minutes, available)
+                    take = min(math.ceil(take / SLOT_MINUTES) * SLOT_MINUTES, available - available % SLOT_MINUTES)
+                    session = StudySession(
+                        task_name=task.name,
+                        day=day.strftime("%A"),
+                        start=_from_minutes(cursor),
+                        end=_from_minutes(cursor + take),
+                        duration_hours=take / 60,
+                        date=day.isoformat(),
+                    )
+                    schedule.append(session)
+                    booked.setdefault(day, []).append((session.start, session.end))
+                    remaining -= take
+                    cursor += take + BREAK_MINUTES
+            day += timedelta(days=1)
 
-        if remaining > 0.05:
-            unscheduled[task.name] = round(remaining, 2)
+        if remaining > 0:
+            placed = round((needed - remaining) / 60, 2)
+            unscheduled[task.name] = round(remaining / 60, 2)
             warnings.append(
-                f"Only {round((task.estimated_hours or 0) - remaining, 2)} of "
-                f"{task.estimated_hours} hour(s) for '{task.name}' fit before the deadline/availability."
+                f"Only {placed} of {task.estimated_hours} hour(s) for '{task.name}' fit before the deadline."
             )
 
+    schedule.sort(key=lambda s: (s.date or "", s.start))
     conflict_check = check_conflicts(
         {
             "schedule": [s.model_dump() for s in schedule],
@@ -521,13 +503,6 @@ def generate_study_schedule(payload: dict[str, Any] | None = None) -> dict[str, 
     )
     if conflict_check["conflicts"]:
         warnings.append("Generated schedule still reported conflicts; review required.")
-
-    total_needed = sum(float(t.estimated_hours or 0) for t in tasks)
-    total_scheduled = sum(s.duration_hours for s in schedule)
-    if total_scheduled + 0.05 < total_needed:
-        warnings.append(
-            f"Only {round(total_scheduled, 2)} of the required {round(total_needed, 2)} hours can be scheduled."
-        )
 
     return {
         "ok": True,
@@ -554,37 +529,32 @@ def summarize_plan(payload: dict[str, Any] | None = None) -> dict[str, Any]:
         )
         return {"ok": False, "summary": text, "message": text}
 
+    # Warnings and coverage come first so a long plan can never hide them.
     lines = ["Here is your conflict-aware study plan:"]
-    by_day: dict[str, list[dict[str, Any]]] = {}
-    for session in schedule:
-        by_day.setdefault(session["day"], []).append(session)
-    for day, items in by_day.items():
-        lines.append(f"{day}:")
-        for session in sorted(items, key=lambda s: s["start"]):
-            lines.append(
-                f"  - {session['start']}-{session['end']}: {session['task_name']} "
-                f"({session['duration_hours']}h)"
-            )
-
+    if warnings:
+        lines.append("Warnings:")
+        lines.extend(f"  - {warning}" for warning in warnings)
+    if conflicts:
+        lines.append(f"Unresolved conflicts: {len(conflicts)}")
     if tasks:
         lines.append("Task coverage:")
         for task in tasks:
-            scheduled = sum(
-                s["duration_hours"] for s in schedule if s["task_name"] == task.get("name")
-            )
-            needed = task.get("estimated_hours") or 0
-            lines.append(f"  - {task.get('name')}: {scheduled}h / {needed}h")
-
-    if warnings:
-        lines.append("Warnings:")
-        for warning in warnings:
-            lines.append(f"  - {warning}")
-    if conflicts:
-        lines.append(f"Unresolved conflicts: {len(conflicts)}")
+            scheduled = sum(s["duration_hours"] for s in schedule if s["task_name"] == task.get("name"))
+            lines.append(f"  - {task.get('name')}: {scheduled:g}h of {task.get('estimated_hours') or 0:g}h")
+    by_day: dict[str, list[dict[str, Any]]] = {}
+    for session in schedule:
+        label = f"{session['day']} {session.get('date') or ''}".strip()
+        by_day.setdefault(label, []).append(session)
+    for label, items in by_day.items():
+        lines.append(f"{label}:")
+        for session in sorted(items, key=lambda s: s["start"]):
+            lines.append(f"  - {session['start']}-{session['end']}: {session['task_name']}")
 
     summary = "\n".join(lines)
     if len(summary) > 1900:
-        summary = summary[:1890] + "…"
+        kept = summary[:1850].rsplit("\n", 1)[0]
+        omitted = summary[len(kept) :].count("\n")
+        summary = f"{kept}\n[{omitted} more line(s) omitted to fit the response limit.]"
     return {"ok": True, "summary": summary, "message": "Plan summarized."}
 
 
@@ -602,35 +572,21 @@ def _day_name_from_deadline(deadline: str | None) -> str | None:
     return _day_from_deadline(deadline)
 
 
-def _date_for_day(day: str) -> str:
-    reference = datetime(2026, 10, 5)
-    idx = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].index(day)
-    return (reference + timedelta(days=idx)).date().isoformat()
-
-
-def _free_slots(
-    day: str,
-    occupied: list[tuple[str, str]],
-    day_start: str,
-    day_end: str,
-) -> list[tuple[str, str]]:
-    """Return free intervals within preferred hours after subtracting occupied ranges."""
-    del day  # day retained for readability at call sites
-    cursor = _to_minutes(day_start)
-    end = _to_minutes(day_end)
-    blocked = sorted(((_to_minutes(s), _to_minutes(e)) for s, e in occupied), key=lambda p: p[0])
-    free: list[tuple[str, str]] = []
-    for b_start, b_end in blocked:
+def _free_slots(occupied: list[tuple[str, str]], opens: int, closes: int) -> list[tuple[int, int]]:
+    """Return free minute ranges within [opens, closes] after subtracting occupied ranges."""
+    cursor = opens
+    free: list[tuple[int, int]] = []
+    for b_start, b_end in sorted((_to_minutes(s), _to_minutes(e)) for s, e in occupied):
         if b_end <= cursor:
             continue
         if b_start > cursor:
-            free.append((_from_minutes(cursor), _from_minutes(min(b_start, end))))
+            free.append((cursor, min(b_start, closes)))
         cursor = max(cursor, b_end)
-        if cursor >= end:
+        if cursor >= closes:
             break
-    if cursor < end:
-        free.append((_from_minutes(cursor), _from_minutes(end)))
-    return [(s, e) for s, e in free if _to_minutes(e) - _to_minutes(s) >= 30]
+    if cursor < closes:
+        free.append((cursor, closes))
+    return [(s, e) for s, e in free if e - s >= SLOT_MINUTES]
 
 
 TOOLS = {

@@ -21,7 +21,7 @@ def index():
 @router.get("/health")
 def health():
     provider = settings.model_provider
-    live = live_credentials_available(provider)
+    live = live_credentials_available()
     return {
         "status": "ok",
         "implementation": "studyplan",
@@ -51,8 +51,8 @@ async def arena_run(payload: ArenaRequest):
 
 @router.post("/chat", response_model=ArenaResponse)
 async def chat(payload: ChatRequest, request: Request):
-    allowed = models()["models"]
-    if payload.model not in allowed:
+    model = default_run_model() if payload.model == "unconfigured" else payload.model
+    if model != default_run_model() and model not in models()["models"]:
         raise HTTPException(400, "Model is not enabled")
     busy = request.app.state.busy
     if payload.session_id in busy:
@@ -60,7 +60,7 @@ async def chat(payload: ChatRequest, request: Request):
     busy.add(payload.session_id)
     memory = request.app.state.memory
     try:
-        result = await execute(payload, memory.get(payload.session_id), payload.model)
+        result = await execute(payload, memory.get(payload.session_id), model)
         memory.add(payload.session_id, payload.task, result.final_response)
         return result
     finally:

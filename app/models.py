@@ -1,10 +1,12 @@
 """Arena HTTP contracts plus StudyPlan Agent domain models."""
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+import re
+from datetime import datetime
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 
 class Contract(BaseModel):
@@ -113,6 +115,48 @@ DecisionStatus = Literal[
 ]
 
 
+WEEKDAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+DAY_ALIASES = {
+    "mon": "Monday",
+    "tue": "Tuesday",
+    "tues": "Tuesday",
+    "wed": "Wednesday",
+    "thu": "Thursday",
+    "thur": "Thursday",
+    "thurs": "Thursday",
+    "fri": "Friday",
+    "sat": "Saturday",
+    "sun": "Sunday",
+    **{day.lower(): day for day in WEEKDAYS},
+}
+
+
+def normalize_day(value: Any) -> str:
+    day = DAY_ALIASES.get(str(value).strip().lower())
+    if not day:
+        raise ValueError(f"Unknown weekday: {value!r}")
+    return day
+
+
+def normalize_time(value: Any) -> str:
+    """Accept 8:30, 08:30, 8 or 2:30 pm and return zero-padded 24-hour HH:MM."""
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", str(value).strip().lower())
+    if not match:
+        raise ValueError(f"Invalid time: {value!r}; expected HH:MM")
+    hour, minute = int(match[1]), int(match[2] or 0)
+    if match[3]:
+        if not 1 <= hour <= 12:
+            raise ValueError(f"Invalid time: {value!r}")
+        hour = hour % 12 + (12 if match[3] == "pm" else 0)
+    if hour > 23 or minute > 59:
+        raise ValueError(f"Invalid time: {value!r}")
+    return f"{hour:02d}:{minute:02d}"
+
+
+Day = Annotated[str, BeforeValidator(normalize_day)]
+ClockTime = Annotated[str, BeforeValidator(normalize_time)]
+
+
 class StudyTask(Contract):
     name: str = Field(min_length=1, max_length=200)
     deadline: str | None = None
@@ -128,11 +172,26 @@ class StudyTask(Contract):
             raise ValueError("Task name must not be blank")
         return value
 
+    @field_validator("deadline", mode="before")
+    @classmethod
+    def normalize_deadline(cls, value: Any) -> str | None:
+        if value in (None, ""):
+            return None
+        parsed = datetime.fromisoformat(str(value))
+        if len(str(value).strip()) == 10:  # date only: due by the end of that day
+            parsed = parsed.replace(hour=23, minute=59)
+        return parsed.replace(tzinfo=None).isoformat(timespec="minutes")
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def normalize_priority(cls, value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
+
 
 class ClassSlot(Contract):
-    day: str = Field(min_length=1, max_length=20)
-    start: str = Field(min_length=4, max_length=5)
-    end: str = Field(min_length=4, max_length=5)
+    day: Day
+    start: ClockTime
+    end: ClockTime
     title: str = "Class"
 
     @model_validator(mode="after")
@@ -143,9 +202,9 @@ class ClassSlot(Contract):
 
 
 class UnavailableSlot(Contract):
-    day: str = Field(min_length=1, max_length=20)
-    start: str = Field(min_length=4, max_length=5)
-    end: str = Field(min_length=4, max_length=5)
+    day: Day
+    start: ClockTime
+    end: ClockTime
     reason: str = "unavailable"
 
     @model_validator(mode="after")
@@ -157,9 +216,9 @@ class UnavailableSlot(Contract):
 
 class StudySession(Contract):
     task_name: str
-    day: str
-    start: str
-    end: str
+    day: Day
+    start: ClockTime
+    end: ClockTime
     duration_hours: float = Field(gt=0, le=8)
     date: str | None = None
 
@@ -196,6 +255,7 @@ class AgentState(BaseModel):
 
     request_id: str
     goal: str
+    source_text: str = ""
     step_count: int = 0
     max_steps: int = 6
     tasks: list[StudyTask] = Field(default_factory=list)
@@ -204,6 +264,7 @@ class AgentState(BaseModel):
     preferred_hours: dict[str, Any] = Field(default_factory=dict)
     validated: bool = False
     validation_issues: list[str] = Field(default_factory=list)
+    schedule_generated: bool = False
     schedule: list[StudySession] = Field(default_factory=list)
     conflicts: list[dict[str, Any]] = Field(default_factory=list)
     conflicts_checked: bool = False
@@ -221,3 +282,19 @@ class AgentState(BaseModel):
     repair_attempts: int = 0
     fault_triggered: bool = False
     blocked_reason: str | None = None
+
+    def allowed_actions(self) -> list[str]:
+        """The only tools legal in the current state; shown to the model and enforced on its reply."""
+        if not self.validated:
+            return ["validate_study_input"]
+        if self.validation_issues:
+            return []
+        if not self.schedule_generated:
+            return ["generate_study_schedule"]
+        if not self.schedule:
+            return []
+        if not self.conflicts_checked:
+            return ["check_conflicts"]
+        if self.conflicts:
+            return ["generate_study_schedule", "summarize_plan"]
+        return ["summarize_plan"]

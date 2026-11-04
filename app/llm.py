@@ -1,6 +1,7 @@
-"""Model provider abstraction: Grok (xAI) for submission, mock only as fallback."""
+"""Model provider layer: Groq free tier (live) with model failover; mock only when explicitly selected."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -11,13 +12,18 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from app.config import settings
 from app.models import AgentDecision, AgentState
-from app.tools import TOOLS, extract_study_context
+from app.tools import _day_from_deadline, extract_study_context
 
 log = logging.getLogger("studyplan.llm")
 
-# Two Grok tiers for the required model-selection experiment.
-GROK_PRIMARY = "grok-4.3"
-GROK_SECONDARY = "grok-4.6"
+MOCK_MODEL = "studyplan-mock-v1"
+
+# Published Groq on-demand prices (USD per 1M input/output tokens). The free tier bills $0;
+# these give a paid-equivalent estimate. Models without a public price report null, never 0.
+MODEL_PRICES = {
+    "openai/gpt-oss-20b": (0.075, 0.30),
+    "openai/gpt-oss-120b": (0.15, 0.60),
+}
 
 BLOCKED_PATTERNS = [
     r"\bsubmit\b.+\b(assignment|coursework|homework|quiz|form)\b",
@@ -36,58 +42,61 @@ class ModelUsage:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         cost: float | None = None,
+        model: str | None = None,
     ):
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.estimated_cost_usd = cost
+        self.model = model
 
 
-def live_credentials_available(provider: str | None = None) -> bool:
-    provider = (provider or settings.model_provider or "").lower()
-    if provider in {"grok", "xai"}:
-        return bool(settings.xai_api_key.strip())
-    return False
+class ModelUnavailableError(RuntimeError):
+    """No configured model could be reached (rate limits, outage, bad key, not configured)."""
+
+
+class InvalidModelOutputError(ValueError):
+    """The model answered, but not with parseable JSON. Handled by the contract-repair path."""
+
+    def __init__(self, detail: str, usage: ModelUsage | None = None):
+        super().__init__(detail)
+        self.usage = usage or ModelUsage()
+
+
+class OutputBudgetExceededError(RuntimeError):
+    """The model hit MAX_OUTPUT_TOKENS, so its decision was cut off."""
+
+    def __init__(self, detail: str, usage: ModelUsage | None = None):
+        super().__init__(detail)
+        self.usage = usage or ModelUsage()
+
+
+class _RateLimitedError(RuntimeError):
+    def __init__(self, detail: str, retry_after: float | None):
+        super().__init__(detail)
+        self.retry_after = retry_after
+
+
+def is_mock_provider() -> bool:
+    return (settings.model_provider or "").strip().lower() == "mock"
+
+
+def live_credentials_available() -> bool:
+    return not is_mock_provider() and bool(settings.groq_api_key.strip())
 
 
 def configured_models() -> list[str]:
     """Models shown in the UI / accepted by /chat. Never includes secrets."""
-    provider = (settings.model_provider or "mock").lower()
-    name = (settings.model_name or "").strip()
-
-    if provider in {"grok", "xai"} and live_credentials_available("grok"):
-        models = [name or GROK_PRIMARY]
-        for extra in (GROK_PRIMARY, GROK_SECONDARY):
-            if extra not in models:
-                models.append(extra)
-        models.append("studyplan-mock-v1")
-        return models
-
-    return ["studyplan-mock-v1"]
-
-
-def resolve_provider(model_name: str) -> str:
-    if model_name in {"studyplan-mock-v1", "mock", "unconfigured", ""}:
-        return "mock"
-    if model_name.startswith("grok"):
-        return "grok" if live_credentials_available("grok") else "mock"
-    provider = (settings.model_provider or "mock").lower()
-    if provider in {"grok", "xai"} and live_credentials_available("grok"):
-        return "grok"
-    return "mock"
+    if is_mock_provider():
+        return [MOCK_MODEL]
+    if not live_credentials_available():
+        return []
+    extras = [m.strip() for m in settings.fallback_models.split(",") if m.strip()]
+    return list(dict.fromkeys([settings.model_name.strip(), *extras]))
 
 
 def default_run_model() -> str:
     """Model used by POST /arena/run."""
-    provider = (settings.model_provider or "mock").lower()
-    if provider in {"grok", "xai"} and live_credentials_available("grok"):
-        return settings.model_name.strip() or GROK_PRIMARY
-    if provider == "mock":
-        return "studyplan-mock-v1"
-    log.warning(
-        "MODEL_PROVIDER=%s but XAI_API_KEY is missing; using studyplan-mock-v1.",
-        provider,
-    )
-    return "studyplan-mock-v1"
+    return MOCK_MODEL if is_mock_provider() else settings.model_name.strip()
 
 
 async def decide(
@@ -99,159 +108,115 @@ async def decide(
     """Return raw decision payload + usage. Validation happens in the agent loop."""
     if force_invalid:
         return {"status": "continue", "action": "not_a_real_tool", "arguments": "bad"}, ModelUsage()
+    if is_mock_provider():
+        return mock_decide(state, messages).model_dump(), ModelUsage(model=MOCK_MODEL)
+    return await _live_decide(messages, model_name)
 
-    provider = resolve_provider(model_name)
-    if provider == "mock":
-        decision = mock_decide(state, messages)
-        return decision.model_dump(), ModelUsage()
 
+async def _live_decide(messages: list[BaseMessage], model_name: str) -> tuple[dict[str, Any], ModelUsage]:
+    """Try the selected model, then the others. Wait out one short rate-limit window, then give up."""
+    if not live_credentials_available():
+        raise ModelUnavailableError("GROQ_API_KEY is not configured")
+
+    candidates = list(dict.fromkeys([model_name, *configured_models()]))
+    failures: list[str] = []
+    for attempt in range(2):
+        retry_after: list[float] = []
+        for model in candidates:
+            try:
+                return await _call_model(messages, model)
+            except _RateLimitedError as exc:
+                log.warning("model_rate_limited model=%s retry_after=%s", model, exc.retry_after)
+                failures.append(str(exc))
+                if exc.retry_after is not None:
+                    retry_after.append(exc.retry_after)
+            except (RuntimeError, httpx.HTTPError) as exc:
+                if isinstance(exc, OutputBudgetExceededError):
+                    raise
+                log.warning("model_call_failed model=%s error=%s", model, type(exc).__name__)
+                failures.append(f"{model}: {type(exc).__name__}: {exc}")
+        wait = min(retry_after, default=None)
+        if attempt or wait is None or wait > settings.max_rate_limit_wait_seconds:
+            break
+        await asyncio.sleep(wait)
+    raise ModelUnavailableError("; ".join(failures[-3:])[:600])
+
+
+def _client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=settings.llm_timeout_seconds)
+
+
+async def _call_model(messages: list[BaseMessage], model: str) -> tuple[dict[str, Any], ModelUsage]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "temperature": 0,
+        "max_tokens": settings.max_output_tokens,
+        "response_format": {"type": "json_object"},
+        "messages": [{"role": _role_for(m), "content": str(m.content)} for m in messages],
+    }
+    if model.startswith("openai/gpt-oss"):
+        # Reasoning tokens count against max_tokens, so keep them small and out of the reply.
+        payload["reasoning_effort"] = "low"
+        payload["include_reasoning"] = False
+
+    async with _client() as client:
+        response = await client.post(
+            f"{settings.llm_base_url.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+            json=payload,
+        )
+
+    if response.status_code == 429:
+        raise _RateLimitedError(f"{model}: rate limited", _retry_after(response))
+    if response.status_code == 400 and "json_validate_failed" in response.text:
+        # Groq JSON mode rejects its own invalid generation; the model did answer, so repair it.
+        raise InvalidModelOutputError("Model output was not valid JSON.", ModelUsage(model=model))
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}: {_scrub(response.text)[:200]}")
+
+    data = response.json()
+    usage = _usage(data, model)
     try:
-        if provider == "grok":
-            return await _grok_decide(messages, model_name)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Grok call failed; falling back to mock: %s", exc)
-        decision = mock_decide(state, messages)
-        return decision.model_dump(), ModelUsage()
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("Unexpected provider response shape") from exc
 
-    decision = mock_decide(state, messages)
-    return decision.model_dump(), ModelUsage()
-
-
-def mock_decide(state: AgentState, messages: list[BaseMessage]) -> AgentDecision:
-    """Deterministic offline policy used when no live key is available."""
-    history_text = _history_text(messages)
-    combined_goal = state.goal
-    text_blob = f"{history_text}\n{combined_goal}"
-
-    if _is_blocked_request(text_blob):
-        return AgentDecision(
-            status="blocked",
-            action=None,
-            arguments={},
-            user_message=(
-                "I can create a sandbox study plan, but I cannot submit coursework, "
-                "send emails, or modify real systems. Please ask only for planning help."
-            ),
-            reasoning_summary="Autonomy boundary triggered.",
-        )
-
-    if not state.tasks and not state.validated:
-        extracted = extract_study_context(combined_goal, history_text)
-        return AgentDecision(
-            status="continue",
-            action="validate_study_input",
-            arguments={
-                "tasks": extracted["tasks"],
-                "classes": extracted["classes"],
-                "unavailable": extracted["unavailable"],
-                "preferred_hours": extracted["preferred_hours"],
-            },
-            user_message="Checking whether your study details are complete enough to schedule.",
-            reasoning_summary="Initial validation of extracted study context.",
-        )
-
-    if not state.validated:
-        extracted = extract_study_context(combined_goal, history_text)
-        return AgentDecision(
-            status="continue",
-            action="validate_study_input",
-            arguments={
-                "tasks": [t.model_dump() for t in state.tasks] or extracted["tasks"],
-                "classes": [c.model_dump() for c in state.classes] or extracted["classes"],
-                "unavailable": [u.model_dump() for u in state.unavailable] or extracted["unavailable"],
-                "preferred_hours": state.preferred_hours or extracted["preferred_hours"],
-            },
-            user_message="Validating study inputs.",
-            reasoning_summary="Inputs not validated yet.",
-        )
-
-    if state.validation_issues:
-        return AgentDecision(
-            status="needs_clarification",
-            action=None,
-            arguments={},
-            user_message=_clarification_message(state.validation_issues),
-            reasoning_summary="Missing or invalid study details.",
-        )
-
-    if not state.schedule:
-        return AgentDecision(
-            status="continue",
-            action="generate_study_schedule",
-            arguments={
-                "tasks": [t.model_dump() for t in state.tasks],
-                "classes": [c.model_dump() for c in state.classes],
-                "unavailable": [u.model_dump() for u in state.unavailable],
-                "preferred_hours": state.preferred_hours,
-            },
-            user_message="Generating a conflict-aware schedule from your constraints.",
-            reasoning_summary="Validated inputs; next create schedule.",
-        )
-
-    if state.schedule and not state.conflicts_checked:
-        return AgentDecision(
-            status="continue",
-            action="check_conflicts",
-            arguments={
-                "schedule": [s.model_dump() for s in state.schedule],
-                "classes": [c.model_dump() for c in state.classes],
-                "unavailable": [u.model_dump() for u in state.unavailable],
-            },
-            user_message="Checking the draft schedule for overlaps with classes and unavailable times.",
-            reasoning_summary="Conflict check before finalizing.",
-        )
-
-    if not state.summary:
-        return AgentDecision(
-            status="continue",
-            action="summarize_plan",
-            arguments={
-                "schedule": [s.model_dump() for s in state.schedule],
-                "warnings": state.schedule_warnings,
-                "tasks": [t.model_dump() for t in state.tasks],
-                "conflicts": state.conflicts,
-            },
-            user_message="Preparing a readable study plan summary.",
-            reasoning_summary="Summarize schedule for the student.",
-        )
-
-    return AgentDecision(
-        status="completed",
-        action=None,
-        arguments={},
-        user_message=state.summary,
-        reasoning_summary="Plan ready.",
-    )
+    if choice.get("finish_reason") == "length":
+        raise OutputBudgetExceededError(f"Output cut off at {settings.max_output_tokens} tokens.", usage)
+    try:
+        decision = _extract_json(content or "")
+    except ValueError as exc:
+        raise InvalidModelOutputError(f"Model output was not valid JSON: {exc}", usage) from exc
+    if not isinstance(decision, dict):
+        raise InvalidModelOutputError("Model output must be a JSON object.", usage)
+    return decision, usage
 
 
-def _clarification_message(issues: list[str]) -> str:
-    bullets = "; ".join(issues[:4])
-    return (
-        "I need a bit more information before I can build a reliable study plan. "
-        f"Please provide: {bullets}. "
-        "Include task names, deadlines (day/date), estimated hours, and class times if relevant."
-    )
+def _usage(data: dict[str, Any], model: str) -> ModelUsage:
+    usage = data.get("usage") or {}
+    input_tokens = usage.get("prompt_tokens")
+    output_tokens = usage.get("completion_tokens")
+    cost = None
+    price = MODEL_PRICES.get(model)
+    if price and input_tokens is not None and output_tokens is not None:
+        cost = (input_tokens * price[0] + output_tokens * price[1]) / 1_000_000
+    return ModelUsage(input_tokens, output_tokens, cost, model)
 
 
-def _is_blocked_request(text: str) -> bool:
-    lower = text.lower()
-    return any(re.search(pattern, lower) for pattern in BLOCKED_PATTERNS)
+def _retry_after(response: httpx.Response) -> float | None:
+    try:
+        return float(response.headers.get("retry-after", ""))
+    except ValueError:
+        return None
 
 
-def _history_text(messages: list[BaseMessage]) -> str:
-    parts: list[str] = []
-    for message in messages:
-        if isinstance(message, HumanMessage):
-            content = str(message.content)
-            if content.startswith("USER GOAL / CURRENT REQUEST:"):
-                continue
-            parts.append(content)
-        elif isinstance(message, AIMessage):
-            parts.append(str(message.content))
-    return "\n".join(parts)
+def _scrub(text: str) -> str:
+    key = settings.groq_api_key.strip()
+    return text.replace(key, "<redacted>") if key else text
 
 
-def _extract_json(text: str) -> dict[str, Any]:
+def _extract_json(text: str) -> Any:
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?", "", text).strip()
@@ -273,52 +238,61 @@ def _role_for(message: BaseMessage) -> str:
     return "user"
 
 
-async def _grok_decide(messages: list[BaseMessage], model_name: str) -> tuple[dict[str, Any], ModelUsage]:
-    if not settings.xai_api_key:
-        raise RuntimeError("XAI_API_KEY is not configured")
+def mock_decide(state: AgentState, messages: list[BaseMessage]) -> AgentDecision:
+    """Deterministic offline policy for tests. Runs only when MODEL_PROVIDER=mock."""
+    history_text = _history_text(messages)
 
-    payload: dict[str, Any] = {
-        "model": model_name,
-        "temperature": 0,
-        "max_tokens": settings.max_output_tokens,
-        "response_format": {"type": "json_object"},
-        "messages": [{"role": _role_for(m), "content": str(m.content)} for m in messages],
-    }
-    async with httpx.AsyncClient(timeout=40) as client:
-        response = await client.post(
-            "https://api.x.ai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.xai_api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
+    if any(re.search(pattern, state.goal.lower()) for pattern in BLOCKED_PATTERNS):
+        return AgentDecision(
+            status="blocked",
+            user_message=(
+                "I can create a sandbox study plan, but I cannot submit coursework, "
+                "send emails, or modify real systems. Please ask only for planning help."
+            ),
+            reasoning_summary="Autonomy boundary triggered.",
         )
-        # Some Grok models may reject response_format; retry once without it.
-        if response.status_code >= 400 and "response_format" in response.text.lower():
-            payload.pop("response_format", None)
-            response = await client.post(
-                "https://api.x.ai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.xai_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-        if response.status_code >= 400:
-            raise RuntimeError(f"Grok HTTP {response.status_code}: {response.text[:500]}")
-        data = response.json()
 
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"Unexpected Grok response shape: {data}") from exc
+    allowed = state.allowed_actions()
+    if not allowed:
+        return AgentDecision(
+            status="needs_clarification",
+            user_message="None of the requested hours fit. Please share more available time.",
+            reasoning_summary="Nothing could be scheduled.",
+        )
 
-    usage = data.get("usage") or {}
-    return _extract_json(content), ModelUsage(
-        input_tokens=usage.get("prompt_tokens"),
-        output_tokens=usage.get("completion_tokens"),
-        cost=None,
+    action = allowed[-1]
+    arguments: dict[str, Any] = {}
+    if action == "validate_study_input":
+        extracted = extract_study_context(state.goal, history_text)
+        arguments = {
+            "tasks": [
+                {
+                    **task,
+                    "deadline_evidence": _day_from_deadline(task.get("deadline")),
+                    "hours_evidence": f"{task['estimated_hours']:g}" if task.get("estimated_hours") else None,
+                }
+                for task in extracted["tasks"]
+            ],
+            "classes": extracted["classes"],
+            "unavailable": extracted["unavailable"],
+            "preferred_hours": extracted["preferred_hours"],
+        }
+    return AgentDecision(
+        status="continue",
+        action=action,
+        arguments=arguments,
+        reasoning_summary=f"Next permitted step: {action}.",
     )
 
 
-_ = TOOLS
+def _history_text(messages: list[BaseMessage]) -> str:
+    parts: list[str] = []
+    for message in messages:
+        if isinstance(message, HumanMessage):
+            content = str(message.content)
+            if content.startswith("USER GOAL / CURRENT REQUEST:"):
+                continue
+            parts.append(content)
+        elif isinstance(message, AIMessage):
+            parts.append(str(message.content))
+    return "\n".join(parts)

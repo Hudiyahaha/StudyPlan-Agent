@@ -1,6 +1,7 @@
-"""Message storage only. Students must use these messages in their model prompt."""
+"""Bounded per-session message history, replayed into the model prompt on each turn."""
 from collections import OrderedDict
 from langchain_core.messages import HumanMessage, AIMessage
+from app.config import settings
 class Memory:
     def __init__(self):
         self.sessions = OrderedDict()
@@ -8,8 +9,11 @@ class Memory:
         return list(self.sessions.get(session, []))
     def add(self, session, user, assistant):
         messages = self.get(session) + [HumanMessage(content=user), AIMessage(content=assistant)]
-        # Six recent turns; also enforce a character ceiling (not a token counter).
-        while len(messages) > 12 or sum(len(str(m.content)) for m in messages) > 24000:
+        # Recent turns only; also enforce a character ceiling (not a token counter).
+        while messages and (
+            len(messages) > settings.max_history_messages
+            or sum(len(str(m.content)) for m in messages) > settings.max_history_chars
+        ):
             messages = messages[2:]
         self.sessions[session] = messages
         self.sessions.move_to_end(session)

@@ -10,12 +10,16 @@ services:
       - key: PYTHON_VERSION
         value: 3.12.10
       - key: MODEL_PROVIDER
-        value: grok
+        value: groq
       - key: MODEL_NAME
-        value: grok-4.3
-      - key: XAI_API_KEY
+        value: openai/gpt-oss-20b
+      - key: FALLBACK_MODELS
+        value: openai/gpt-oss-120b,qwen/qwen3.8-27b
+      - key: GROQ_API_KEY
         sync: false
       - key: MAX_STEPS
         value: "6"
       - key: MAX_TOOL_RETRIES
         value: "2"
+      - key: TIMEZONE
+        value: Asia/Karachi
