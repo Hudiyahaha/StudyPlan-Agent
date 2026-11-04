@@ -9,12 +9,12 @@ Agent name: StudyPlan Agent
 Domain: Study-Plan Builder
 
 GitHub repository URL: [https://github.com/Hudiyahaha/StudyPlan-Agent](https://github.com/Hudiyahaha/StudyPlan-Agent)
-Final commit hash: PENDING (demo branch commit, added after the push)
-Working agent interface: PENDING (Render URL)
-Health endpoint (GET): PENDING (Render URL)/health
-Arena endpoint (POST): PENDING (Render URL)/arena/run
-Manifest endpoint (GET): PENDING (Render URL)/arena/manifest
-API documentation: PENDING (Render URL)/docs
+Final commit hash: 55e159da0499ac47d2ba6890123bd6e0e274f15c (deployed code, branch demo-live-groq; the next commit adds only this summary and the public test results)
+Working agent interface: [https://studyplan-agent.onrender.com/](https://studyplan-agent.onrender.com/)
+Health endpoint (GET): [https://studyplan-agent.onrender.com/health](https://studyplan-agent.onrender.com/health)
+Arena endpoint (POST): [https://studyplan-agent.onrender.com/arena/run](https://studyplan-agent.onrender.com/arena/run)
+Manifest endpoint (GET): [https://studyplan-agent.onrender.com/arena/manifest](https://studyplan-agent.onrender.com/arena/manifest)
+API documentation: [https://studyplan-agent.onrender.com/docs](https://studyplan-agent.onrender.com/docs)
 
 Hosting provider: Render (free plan)
 Default model / provider: qwen/qwen3.8-27b / Groq
@@ -22,8 +22,8 @@ Other available models: openai/gpt-oss-120b, openai/gpt-oss-20b (also used as au
 Example input: I have PDC assignment due Tuesday needing 4 hours and AI quiz Wednesday needing 3 hours. Classes Monday 8:30-14:30 and Tuesday 10:00-13:00. Make a study plan.
 Expected result: A completed, conflict-free plan that places all 7 hours outside class times and before each deadline.
 Cold-start / restart limitations: The free Render service sleeps when idle, so the first request can take about a minute. Chat history is held in memory and is lost on restart or sleep. The deployment uses one worker.
-Repository access: PENDING (instructor invited / access confirmed)
-Public test results: evaluation/public_results.json
+Repository access: Repository is currently public; instructor invitation not yet confirmed
+Public test results: evaluation/public_results.json (13/13 checks passed against the live deployment on 2026-11-04)
 
 ## Update after the original submission
 
